@@ -8,7 +8,7 @@ set -euo pipefail
 # - If sources/install.wim > 4GB, splits it via wimlib
 #
 # Usage:
-#   sudo ./create-win-usb.sh -i /path/to/Win.iso [-d diskX] [-n WINDOWSUSB] [-s 3800]
+#   ./create-win-usb.sh -i /path/to/Win.iso [-d diskX] [-n WINDOWSUSB] [-s 3800]
 #
 # Notes:
 #   * Requires: rsync, hdiutil, diskutil
@@ -28,12 +28,6 @@ confirm() {
   local prompt="$1"
   read -r -p "$prompt [y/N]: " ans
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
-}
-
-need_root() {
-  if [[ $EUID -ne 0 ]]; then
-    err "Please run as root (e.g., sudo $0 ...)"
-  fi
 }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -85,21 +79,18 @@ ensure_wimlib() {
     info "Installing wimlib via Homebrew..."
     brew install wimlib
   else
-    info "Homebrew not found."
-    if confirm "Install Homebrew automatically to get wimlib?"; then
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-      eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || true)"
-      eval "$(/usr/local/bin/brew shellenv 2>/dev/null || true)"
-      brew install wimlib
-    else
-      err "wimlib is required to split install.wim >4GB. Install it and re-run."
-    fi
+    err "wimlib is required to split install.wim >4GB. Please install Homebrew (https://brew.sh) and wimlib, then re-run."
   fi
+}
+
+get_wimlib_path() {
+  # Find wimlib-imagex in PATH (works for both Intel and Apple Silicon Macs)
+  command -v wimlib-imagex || echo "wimlib-imagex"
 }
 
 usage() {
   cat <<EOF
-Usage: sudo $0 -i /path/to/Windows.iso [-d diskX] [-n WINDOWSUSB] [-s 3800]
+Usage: $0 -i /path/to/Windows.iso [-d diskX] [-n WINDOWSUSB] [-s 3800]
 
 Options:
   -i   Path to Windows ISO (required)
@@ -129,7 +120,35 @@ done
 [[ -n "$ISO_PATH" ]] || { usage; err "ISO path is required (-i)"; }
 [[ -f "$ISO_PATH" ]] || err "ISO not found: $ISO_PATH"
 
-need_root
+# --- Validate ISO file -------------------------------------------------------
+
+info "Validating ISO file..."
+
+# Check file extension
+if [[ ! "$ISO_PATH" =~ \.(iso|ISO)$ ]]; then
+  err "File does not have .iso extension: $ISO_PATH"
+fi
+
+# Check if file is actually an ISO (check for ISO 9660 signature)
+# ISO 9660 has "CD001" at byte offset 32769 (0x8001)
+if have_cmd dd && have_cmd xxd; then
+  ISO_SIGNATURE=$(dd if="$ISO_PATH" bs=1 skip=32769 count=5 2>/dev/null | xxd -p)
+  if [[ "$ISO_SIGNATURE" != "4344303031" ]]; then  # "CD001" in hex
+    err "File does not appear to be a valid ISO image (missing ISO 9660 signature): $ISO_PATH"
+  fi
+  info "✓ ISO file signature validated"
+else
+  # Fallback: check file command if available
+  if have_cmd file; then
+    FILE_TYPE=$(file -b "$ISO_PATH")
+    if [[ ! "$FILE_TYPE" =~ (ISO|9660|UDF|boot) ]]; then
+      err "File does not appear to be a valid ISO image: $ISO_PATH"
+    fi
+    info "✓ ISO file type validated"
+  else
+    info "⚠ Could not verify ISO signature (dd/xxd/file not available), proceeding anyway..."
+  fi
+fi
 
 # --- Select disk -------------------------------------------------------------
 
@@ -141,6 +160,42 @@ fi
 
 [[ -n "$DISK_ID" ]] || err "No disk identifier provided."
 [[ -e "/dev/$DISK_ID" ]] || err "/dev/$DISK_ID does not exist."
+
+# --- Validate USB disk -------------------------------------------------------
+
+info "Validating disk /dev/$DISK_ID..."
+
+# Check if disk is removable (external)
+DISK_INFO=$(/usr/sbin/diskutil info "/dev/$DISK_ID" 2>&1)
+if [[ $? -ne 0 ]]; then
+  err "Failed to get disk information for /dev/$DISK_ID"
+fi
+
+# Check for removable media flag
+if ! echo "$DISK_INFO" | grep -qi "Removable Media:.*Yes\|Protocol:.*USB\|Device Location:.*External"; then
+  echo "$DISK_INFO" | grep -E "Removable Media:|Protocol:|Device Location:" || true
+  err "Disk /dev/$DISK_ID does not appear to be a removable USB drive. Refusing to proceed for safety."
+fi
+
+# Additional check: ensure it's not an internal disk
+if echo "$DISK_INFO" | grep -qi "Device Location:.*Internal\|Protocol:.*SATA\|Protocol:.*PCI"; then
+  echo "$DISK_INFO" | grep -E "Removable Media:|Protocol:|Device Location:" || true
+  err "Disk /dev/$DISK_ID appears to be an internal disk. Refusing to proceed for safety."
+fi
+
+# Check if it's the boot disk
+BOOT_DISK=$(/usr/sbin/diskutil info / | awk -F'[:/ ]+' '/Device Node/{print $3}')
+if [[ "/dev/$DISK_ID" == "/dev/$BOOT_DISK" ]] || [[ "$DISK_ID" == "$BOOT_DISK" ]]; then
+  err "Disk /dev/$DISK_ID is your boot disk! Refusing to proceed for safety."
+fi
+
+# Display key disk information for user confirmation
+echo ""
+echo "Disk Information:"
+echo "$DISK_INFO" | grep -E "Device Node:|Media Name:|Device / Media Name:|Total Size:|Protocol:|Removable Media:|Device Location:" || true
+echo ""
+
+info "✓ Disk validated as removable USB drive"
 
 info "You selected /dev/$DISK_ID."
 echo "!!! WARNING: This will ERASE /dev/$DISK_ID completely."
@@ -162,12 +217,35 @@ mount_rw_fat_if_needed "$USB_VOL"
 
 # --- Mount ISO ---------------------------------------------------------------
 
-info "Mounting ISO: $ISO_PATH"
-/usr/bin/hdiutil attach -nobrowse -readonly "$ISO_PATH" >/tmp/winiso.attach.out
-ISO_VOL="$(detect_iso_volume)"
-[[ -d "$ISO_VOL" ]] || err "Could not locate mounted ISO volume."
+# Check if ISO is already mounted
+info "Checking if ISO is already mounted..."
+ALREADY_MOUNTED=""
+HDIUTIL_OUTPUT=$(/usr/bin/hdiutil info 2>/dev/null) || HDIUTIL_OUTPUT=""
 
-info "ISO mounted at: $ISO_VOL"
+if [[ -n "$HDIUTIL_OUTPUT" ]]; then
+  # Look for our ISO path, then find the mount point in following lines
+  FOUND_ISO=false
+  while IFS= read -r line; do
+    if [[ "$line" == *"$ISO_PATH"* ]]; then
+      FOUND_ISO=true
+    elif [[ "$FOUND_ISO" == true && "$line" == *"/Volumes/"* ]]; then
+      # Extract mount point (format: /dev/diskX /Volumes/...)
+      ALREADY_MOUNTED=$(echo "$line" | grep -o '/Volumes/[^[:space:]]*' | head -1)
+      break
+    fi
+  done <<< "$HDIUTIL_OUTPUT"
+fi
+
+if [[ -n "$ALREADY_MOUNTED" && -d "$ALREADY_MOUNTED" ]]; then
+  info "ISO already mounted at: $ALREADY_MOUNTED"
+  ISO_VOL="$ALREADY_MOUNTED"
+else
+  info "Mounting ISO: $ISO_PATH"
+  /usr/bin/hdiutil attach -nobrowse -readonly "$ISO_PATH" >/tmp/winiso.attach.out || err "Failed to mount ISO"
+  ISO_VOL="$(detect_iso_volume)"
+  [[ -d "$ISO_VOL" ]] || err "Could not locate mounted ISO volume."
+  info "ISO mounted at: $ISO_VOL"
+fi
 
 # --- Determine WIM path/size -------------------------------------------------
 
@@ -198,7 +276,8 @@ if [[ "$INSTALL_PATH" == "$WIM_PATH" && "$INSTALL_SIZE" -gt "$FOUR_GB" ]]; then
   /bin/mkdir -p "$USB_VOL/sources"
 
   info "Splitting install.wim into ${SPLIT_MB}MB chunks as install.swm..."
-  /usr/local/bin/wimlib-imagex split "$WIM_PATH" "$USB_VOL/sources/install.swm" "$SPLIT_MB"
+  WIMLIB_CMD="$(get_wimlib_path)"
+  "$WIMLIB_CMD" split "$WIM_PATH" "$USB_VOL/sources/install.swm" "$SPLIT_MB"
 else
   info "No split needed; copying entire ISO contents..."
   /usr/bin/rsync -avh --progress "$ISO_VOL"/ "$USB_VOL"
